@@ -1,0 +1,10 @@
+- sprawdzic fcntl error code
+- czy read >= sizeof pkt jest dobre?    yes
+- sprawdzac (debug) error cody z read
+- poprawic HELO w mailu! 		done
+- SYN w mailu o UDP - wywalic 		done
+- dodac Subject				done
+- resolve po grupach hostow???		done
+- queso and nmap - improve detection	partially
+- add flood prevention mechanism
+- dziwny list o skanie - zlokalizowac bug'a done(?)
