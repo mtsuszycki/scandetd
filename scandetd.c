@@ -1,269 +1,156 @@
-/*
- * Scandeted 1.0
- *
- * Scandetd is daemon which tries to recognize port scans. 
- * If that happens daemon sends e-mail to root@localhost  (by default) 
- * with following informations:
- * 
- * - host  
- * - number of connections made
- * - port of the first connection and it's time
- * - port of the last one and it's time
- * - guessed type of scan (FIN, SYN) 
- *
- * compile: gcc scandetd.c -o scandetd
- *
- *
- * author: Michal Suszycki	mike@wizard.ae.krakow.pl
- *
- * You can change few define's and variables below this comment to tune
- * scandetd to your needs.
- * 
- * This code was based on IpLogger Package by Mike Edulla (medulla@infosoc.com)
- * 
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 1, or (at your option)
- * any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
+#include <pwd.h>
+#include <grp.h>
+#include "config.h"
+#include "scandetd.h"
+
+#include <sys/ioctl.h>
+//#include <linux/if.h>
+//#include <linux/if_ether.h>
+
+#define VERSION "1.2.2"
+
+#define SCAN_EXPIRE	120
+#define PROT_TYPE(p)	(p)==TCP_TYPE?"":"UDP "
+
+#define MAIL_TIME_LIMIT	60
+
+struct tcppkt pkt;
+struct udppkt udp_pkt;
+
+int syslog_facility = LOG_FACILITY;
+int dns_resolve;
+int port_resolve;
+int flood_det;
+int log_details;
+int detect_osfp = 1;
+
+/* not used yet - mail flooding prevention */
+struct mail_limit_t {
+	time_t last;
+	int disabled;
+} mail_limit;
+
+int osfp_options;
+
+int mail_port = MAIL_PORT;
  
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <syslog.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <time.h>
-#include <signal.h>
-#include <string.h>
+int count_threshold = COUNT_THRESHOLD;
 
+struct config_group tcp_opt;
+struct config_group udp_opt;
 
-#if (linux)
-#define __FAVOR_BSD
-#endif
+struct config_group *cfg[] = { &tcp_opt, &udp_opt };
 
-#include <netinet/in_systm.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
+volatile int alarm_flag;
+time_t now;
 
-extern int errno;
+struct host tcp_hosts[HOW_MANY];
+struct host udp_hosts[HOW_MANY];
+struct host osf_hosts[HOW_MANY];  /* for OS fingerprinting detection */
+struct host *hosts[] = { tcp_hosts, udp_hosts, osf_hosts };
 
+extern struct config_item config[];
 
-/* 
- * how many hosts should I remember. If your server is heavily loaded it's
- * good idea to increase this number a little bit
- */
-#define HOW_MANY 6
-
-/*
- * how many connections should I recognize as scanning?
- */
-#define SCAN 20
-
-/* 
- * uncomment this to enable printing to log files scan warnings (using syslogd)
- */
-//#define DOSYSLOG
-
-/* 
- * uncoment this if you want to log every connection attempt (using syslogd)
- */
-//#define LOGCON
-
-/* 
- *  here you can define special port you want to ignore:
- *  if 'scanning' started and ended on the same port and this port is equal
- *  to NOPORT then 'scanning'  will be ignored. If you  notice for example that
- *  your server get a lot of fast connections (from one host) to www port you 
- *  can define NOPORT to 80 so there will be no false warnings 
- */ 
-#define NOPORT 80
-
-/* 
- * If next connection arrived right after the previous one we have to count it.
- * Default time is 1 second.
- */
-#define SEC 1
-
-/* 
- * We use this port for sending mail 
- */
-#define MAILPORT 25
-
-/* 
- * we send mail to <user@host>: 
- */
-char *mail_to = "<root@localhost>";
-
-/* 
- * IP of the machine which sends our mail 
- */
-char *mail_host = "127.0.0.1";
-
-/* 
- * mail will be send from host: 
- */
-char *from_host = "localhost";
-
-
-/* ------------------- end of user's configuration  ----------------------- */
-
-#ifndef NOFILE
-#define NOFILE 1024
-#endif
-
-
-char *hostlookup(int i)
+static inline char *hostlookup(int i)
 {
-	static char buff[256];
+	static char buf[64];
 	struct in_addr ia;
-	struct hostent *he;
+	struct hostent *he = 0;
 	ia.s_addr = i;
-	
-	if (!(he = gethostbyaddr((char *)&ia, sizeof ia, AF_INET)))
-		strncpy(buff,inet_ntoa(ia),sizeof buff);
-	else
-		strncpy(buff,he->h_name,sizeof buff);
-	return buff;
+	bzero(buf, sizeof buf);
+	if(!dns_resolve) {
+		strncpy(buf, inet_ntoa(*(struct in_addr *)&i) , sizeof buf - 1);
+		return buf;
+	}
+	if ((he = gethostbyaddr((char *)&ia, sizeof ia, AF_INET)))
+		strncpy(buf, he->h_name, sizeof buf - 1);
+	else strncpy(buf, inet_ntoa(*(struct in_addr *)&i), sizeof buf - 1);
+	return buf;
 }
 
-char *servlookup(unsigned short port)
+static inline char *servlookup(unsigned short port, enum prot_type p, int flag)
 {
 	struct servent *se;
-   	static char buff[256];
-      
-   	se=getservbyport(port, "tcp");
-   		if(se == NULL) sprintf(buff, "port %d", ntohs(port));
-       		else sprintf(buff, "%s", se->s_name);
-	return buff;
-}
-
-struct ippkt{
-	struct ip ip;
-	struct tcphdr tcp;
-} pkt;
-
-struct host{
-	unsigned int from;
-	time_t t;
-	time_t start;
-	unsigned short low_port;
-	unsigned short hi_port;
-	unsigned int count, fin_count, syn_count;
-} hosts[HOW_MANY];
-
-void be_a_daemon()
-{
-	int fd, f;
+   	static char buf[32];
+        char *type[] = {"tcp", "udp"};
+	snprintf(buf, sizeof buf, flag?"port %d":"%d", ntohs(port));
+	if(!port_resolve) return buf;
 	
-	if (getppid() != 1){
-		signal(SIGTTOU,SIG_IGN);
-		signal(SIGTTIN,SIG_IGN);
-		signal(SIGTSTP,SIG_IGN);
-		f = fork();
-		if (f < 0)
-			exit(-1);
-		
-		if (f > 0)
-			 exit (0);
-	/* child process */		
-	setpgid(0,0);
-	for (fd = 0 ; fd < NOFILE; fd++) close(fd);
-	chdir("/");
-	umask(0);
-	return;
-	}
-}	
+   	se = getservbyport(port, type[p]);
+   	if(se) snprintf(buf, sizeof buf, "%s", se->s_name);
+	return buf;
+}
 
 void init()
 {
-    int i;
-    time_t now;
+    int i, j;
     now = time(NULL);
-    for (i = 0; i < HOW_MANY; i++)
-	hosts[i].t = now;
+    for(j = 0; j < PROT_NR; j++)
+    	for (i = 0; i < HOW_MANY; i++)
+		hosts[j][i].t = now;
 }
 
-int allocate(int *p, unsigned int addr)
+void pid_file(char *s)
 {
-	int i, v = 0;
-	time_t tmp = hosts[0].t;
-	for( i = 0; i < HOW_MANY; i++){
-		if (hosts[i].t <= tmp) {
-			tmp = hosts[i].t;
-			v = i;
+	FILE *f;
+	f = fopen(s, "w");
+	if(!f) return;
+	fprintf(f, "%d\n", getpid());
+	fclose(f);
+}
+
+/*
+ * If there is no empty slot then
+ * choose the oldest one.
+ */
+struct host *allocate(int *p, unsigned int addr, enum prot_type j)
+{
+	int i;
+	struct host *v = 0;
+	struct host *cur = hosts[j];
+	time_t tmp = cur[0].t;
+	for(i = 0; i < HOW_MANY; i++){
+		if (cur[i].t <= tmp) {
+			tmp = cur[i].t;
+			v = &cur[i];
 		}
-		if (hosts[i].from == addr){
+		if (cur[i].from == addr){
 			*p = 1;
-			return i;
+			return &cur[i];
 		}
 	}
 	*p = 0;
 	return v;
 }
 
-/* for debug */ 
-void show(int a)
-{
-	int i;
-	
-	for (i = 0; i < HOW_MANY; i++){
-		printf("Host %s, time %ld, count=%d, l=%d,",
-			hostlookup(hosts[i].from),hosts[i].t, hosts[i].count,
-			ntohs(hosts[i].low_port));
-		printf("hi = %d\n",ntohs(hosts[i].hi_port));
-	}		
-	exit (0);
-}
-
-void no_zombie(int i)
-{
-	wait(NULL);
-}
-
-int send_mail(struct host *bad)
+int __send_mail(char *buf, char *subject)
 {
 	static struct sockaddr_in sa;
-	int s, i, low, high;
-	char buf[1024], combuf[256];
-	
-	char *comm[] = { "HELO ", 			from_host,
-			 "MAIL FROM: SCANDETD@",	from_host,
-			 "RCPT TO:"		,	mail_to,
-			 "DATA"			,	" "
-			};
+	int s, i, mailport;
+	char combuf[256];
+	char *smtprelay;
+	char *from = get_config_item("MailFrom")->value.svalue;
+	char *to = get_config_item("RcptTo")->value.svalue;
+	char *comm[] = {
+		"HELO "	 	, get_config_item("HelloMsg")->value.svalue,
+		"MAIL FROM: "	, from,
+		 "RCPT TO:"	,  to,
+		 "DATA"		, " ",
+		 "From: "	, from,
+		 "To: "		, to,
+		 "Subject: "	, subject
+	};
 	i = fork();
-	
 	if (i < 0) return -1;
-	if (!i) return 0;
-	
-	low = ntohs(bad->low_port);
-	high = ntohs(bad->hi_port);
-	strncpy(combuf,ctime(&bad->t),sizeof combuf);
-	sprintf(buf,"Possible port scanning from %s,\n"
-		    "I've counted %d connections.\n\n"
-		    "First connection was made to %d port at %s"
-		    "Last connection was made to %d port at %s\n"
-		    "Probably it was %s" 
-		    " (%d FIN flags and %d SYN flags)\r\n.\r\n",
-		hostlookup(bad->from),bad->count, low, ctime(&bad->start), 
-		high,  combuf,
-		bad->fin_count>bad->syn_count?"FIN stealth scan":"SYN scan",
-		bad->fin_count, bad->syn_count);
-					
-	sa.sin_port = htons(MAILPORT);
+	if (i) return 0;
+
+	mailport = *get_config_item("MailPort")->value.ivalue;
+	smtprelay = get_config_item("SMTPRelay")->value.svalue;
+
+	sa.sin_port = htons(mailport);
 	sa.sin_family = AF_INET;
-	if ((sa.sin_addr.s_addr = inet_addr(mail_host)) == -1)
+
+	if ((sa.sin_addr.s_addr = inet_addr(smtprelay)) == -1)
 		exit (-1);
 	
 	bzero(&sa.sin_zero, 8);
@@ -272,9 +159,9 @@ int send_mail(struct host *bad)
 	
 	if (connect(s,(struct sockaddr *) &sa, sizeof (struct sockaddr)) < 0)
 		exit (-1);
-	
-	for (i = 0; i < 8 ; i += 2){
-		sprintf(combuf,"%s%s\n",comm[i],comm[i+1]);
+	read(s, combuf, sizeof combuf);
+	for (i = 0; i < sizeof comm/sizeof (char *) ; i += 2){
+		snprintf(combuf, sizeof combuf, "%s%s\n",comm[i], comm[i+1]);
 		if (write(s,combuf,strlen(combuf)) < 0 ){
 			close(s);
 			exit(-1);
@@ -288,82 +175,562 @@ int send_mail(struct host *bad)
 	exit(0);
 }
 
-void action(struct ippkt *pkt)
+/* No more that 1 mail per minute is allowed */
+int flood_prevent(char *msg)
 {
-	int i, was = 0;
-	time_t now;
-	now = time(NULL);
-
-#ifdef LOGCON
-	syslog(LOG_NOTICE,"%s connecion attempt from %s",
-		servlookup(pkt->tcp.th_dport),
-		hostlookup(pkt->ip.ip_src.s_addr));
-#endif	
-	i = allocate(&was,pkt->ip.ip_src.s_addr);
-			
-	if (!was){
-		if (hosts[i].count >= SCAN
-#ifdef NOPORT				
- 		&& hosts[i].low_port != htons(NOPORT)
-		&& hosts[i].hi_port  != htons(NOPORT)
-#endif
-						){
-			send_mail(&hosts[i]);
-#ifdef DOSYSLOG			
-			syslog(LOG_NOTICE,"Possible port scanning from %s",
-				hostlookup(hosts[i].from));
-#endif
-		}
-		hosts[i].from = pkt->ip.ip_src.s_addr;
-		hosts[i].low_port = pkt->tcp.th_dport; 
-		hosts[i].hi_port = pkt->tcp.th_dport;
-		hosts[i].count = 1;
-		hosts[i].syn_count = (pkt->tcp.th_flags) & TH_SYN ? 1:0;
-		hosts[i].fin_count = (pkt->tcp.th_flags) & 1 ? 1:0;
-		hosts[i].start = now;
+	time_t now = time(0);
+	if(now - mail_limit.last > MAIL_TIME_LIMIT) {
+		mail_limit.disabled = 0;
+		mail_limit.last = now;
+	}	
+	else if(!mail_limit.disabled) {
+		mail_limit.disabled = 1;
+		mail_limit.last = now;
+		__send_mail(msg, "Mail notification disabled for a minute.");
 	}
-	/* if the connection was right after the previous one we must count it */
-	if (now - SEC <= hosts[i].t){
-		hosts[i].count++;
-		hosts[i].hi_port = pkt->tcp.th_dport;
-		hosts[i].syn_count += (pkt->tcp.th_flags) & TH_SYN ? 1:0; 		
-		hosts[i].fin_count += (pkt->tcp.th_flags) & 1 ? 1:0; 		
-	}
-	hosts[i].t = now;
+	return mail_limit.disabled;
 }
 
-void main(int argc, char **argv)
+struct fmt 
 {
-	int s;
+	char c;
+	int *p;
+	char *(*f)(int);
+};
+
+static char *protocol(int i)
+{
+	return i==UDP_TYPE?"UDP":"TCP";
+}
 	
-	if (geteuid()){
-		printf("This program requires root priviledges.\n");
-		exit(0);
-	}
-#if (freebsd)
-	printf("dupa\n");
-#endif
-	be_a_daemon();
-	init();
-	if  ((s = socket(AF_INET, SOCK_RAW, 6)) == -1)
-		exit(0);
-	
+static char *make_subject(struct host *h, enum prot_type p)
+{
+	struct fmt format[] = { 
+		{ 's' , &h->from, hostlookup },
+		{ 'd', &h->dst, hostlookup }, 
+		{ 'p', (int *)&p, protocol }
+	};
+	static char buf[64];
+	int i, n, size = sizeof format/sizeof (struct fmt);
+	char *s = get_config_item("MailSubject")->value.svalue;
+	char *ptr;
+	int tmp;
 		
-
-#ifdef DOSYSLOG
-	openlog("scandetd", 0, LOG_LOCAL2);
-	syslog(LOG_NOTICE,"scandetd started and ready");
-#endif
-//	signal(SIGINT,show);
-	
-/* to avoid zombies */
-	signal(SIGCHLD,no_zombie);
-
-	while(1){
-		read(s, (struct ippkt*) &pkt, sizeof(pkt));
-		/* TH_FIN or TH_SYN is set and TH_ACK is zero */
-		if (pkt.tcp.th_flags < 3 && !(pkt.tcp.th_flags & TH_ACK)) 
-			action(&pkt);
+	if(!s) return "Scan detected";
+	bzero(buf, sizeof buf);
+	for(n = 0; n < sizeof buf && *s; n++) {
+		if(*s != '%') {
+			buf[n] = *s++;
+			continue;
+		}
+		if(!*(++s)) break;	
+		for(i = 0; i < size; i++) { 
+			if(format[i].c != *s) continue;
+			ptr = format[i].f(*format[i].p);
+			tmp = strlen(ptr);
+			snprintf(buf + n, sizeof buf - n, "%s", ptr );
+			n += tmp - 1;
+			break;
+		}			
+		s++;			
 	}
+	return buf;
 }
 
+
+int send_mail(struct host *h, enum prot_type p)
+{
+	char buf[512], buf1[32], hostbuf[32];
+	int low, high;
+	char *type[] = { "SYN", "FIN stealth", "Null" };
+	int i = 0;
+	int c = 0;
+	
+	if(!(cfg[p]->flags & SEND_MAIL)) return 0;
+	if(h->flags & MAIL_SENT) return 0;
+	h->flags |= MAIL_SENT;
+	if(!h->fin_count && !h->syn_count) i = 2;
+	else if(h->fin_count > h->syn_count) i = 1;
+	 
+	low = ntohs(h->low_port);
+	high = ntohs(h->hi_port);
+	strncpy(buf1, ctime(&h->t), sizeof buf1);
+	strncpy(hostbuf, hostlookup(h->dst), sizeof hostbuf);
+
+	c = snprintf(buf, sizeof buf, 
+		    "Possible %s port %s from %s to %s%s\n"
+		    "I've counted %d connections.\n\n"
+		    "First connection was made to %d port at %s"
+		    "Last connection was made to %d port at %s\n",
+		p==UDP_TYPE?"UDP":"TCP", h->flood>h->count/2?"flooding":"scanning",
+		hostlookup(h->from), 
+		hostbuf,
+		h->flags&DST_CHANGED?" (and others),":",",
+		h->count, low, ctime(&h->start), 
+		high, buf1);
+	if(p == TCP_TYPE) 
+		snprintf(buf + c, (sizeof buf) - c,	
+		    "Probably it was a %s scan" 
+		    " (%d FIN flags and %d SYN flags)\r\n.\r\n",
+		    type[i], h->fin_count, h->syn_count);
+	else snprintf(buf + c, (sizeof buf) - c, "\r\n.\r\n");	
+	if(flood_prevent(buf)) return 0;
+	__send_mail(buf, make_subject(h,p));
+	return 0;
+}
+
+static int addrport_match(int addr, int port, struct host_t *h)
+{
+	struct port_range *p;
+	int ret = 0;
+	if((addr & h->mask.s_addr) == h->ip.s_addr) {
+		ret = 1;	
+		for_each(p, h->ports) {
+			ret = 0; 
+			if(port >= p->start_port && port <= p->end_port) {
+#ifdef DEBUG
+			syslog(LOG_NOTICE, __FUNCTION__ ": %d (%d %d) returned 1", port, p->start_port, p->end_port);
+#endif
+				return 1;
+			}	
+		}	
+	}
+#ifdef DEBUG
+	syslog(LOG_NOTICE, __FUNCTION__ ": returned %d", ret);
+#endif
+	return ret;
+}
+
+/*
+ * Check if a given packet match src_addr:src_port -> dest_addr:dest_port
+ * criteria as specified in a configuration file.
+ */
+static int packet_match(struct any_pkt *ap, struct list_head *h)
+{
+	struct config_host *p;
+	int a, b;
+#ifdef DEBUG
+	syslog(LOG_NOTICE, "Entering " __FUNCTION__);
+#endif	
+	for_each(p, *h) {
+		a = addrport_match(ap->ip.ip_src.s_addr, ntohs(ap->source), &p->src);
+		if(a && !p->dst_mark) {
+#ifdef DEBUG
+			syslog(LOG_NOTICE, __FUNCTION__ ": returned 1 - src match");
+#endif
+			return 1;
+		}	
+		b = addrport_match(ap->ip.ip_dst.s_addr, ntohs(ap->dest), &p->dst);
+		if(a && b) {
+#ifdef DEBUG
+			syslog(LOG_NOTICE, __FUNCTION__ ": returned 1 - dest match");
+#endif
+			return 1;
+		}
+	}
+#ifdef DEBUG
+	syslog(LOG_NOTICE, __FUNCTION__ ": returned 0");
+#endif		
+	return 0;
+}
+
+static inline int ignore_port(int *p, int lport)
+{
+	for(; p && *p; p++) 
+		if(*p == lport) return 1;
+#ifdef DEBUG
+	syslog(LOG_NOTICE, __FUNCTION__ ": returned 0");
+#endif		
+	return 0;
+}
+
+static void dolog_details(struct any_pkt *ap, enum prot_type p)
+{
+	char s[32], port[16];
+	snprintf(s, sizeof s,  hostlookup(ap->ip.ip_dst.s_addr));
+	snprintf(port, sizeof port, servlookup(ap->dest, p, 0));
+
+	syslog(LOG_NOTICE, "%s %s(%s) -> %s(%s)",
+		p==UDP_TYPE?"UDP":"TCP",
+		hostlookup(ap->ip.ip_src.s_addr),
+		servlookup(ap->source, p, 0),
+		s,
+		port
+		);
+}	
+	
+static void dolog(struct any_pkt *ap, enum prot_type p)
+{
+	if(packet_match(ap, &cfg[p]->host_log_ign))
+		 return;
+
+	if(ignore_port(cfg[p]->port_log_ignore, ntohs(ap->dest))) return;
+	if(log_details) {
+		dolog_details(ap, p);
+		return;
+	}	
+	if(dns_resolve)	
+		syslog(LOG_NOTICE,"%s%s connection attempt from %s (%s)",
+			PROT_TYPE(p),
+			servlookup(ap->dest, p, 1),
+			hostlookup(ap->ip.ip_src.s_addr),
+			inet_ntoa(ap->ip.ip_src));
+	else
+		syslog(LOG_NOTICE,"%s%s connection attempt from %s",
+			PROT_TYPE(p),
+			servlookup(ap->dest, p, 1),
+			inet_ntoa(ap->ip.ip_src)
+			);
+}	
+
+void log_scan(struct host *h, enum prot_type p)
+{
+	char buf[32];
+	if(!(cfg[p]->flags & LOG_SCAN)) return;
+	if(h->flags & SCAN_LOGGED) return;
+	h->flags |= SCAN_LOGGED;
+	strncpy(buf, hostlookup(h->dst), sizeof buf);
+	syslog(LOG_NOTICE,"Possible %sport %s from %s to %s%s",
+			PROT_TYPE(p),
+			h->flood>h->count/2?"flood":"scan",
+			hostlookup(h->from),
+			buf,
+			h->flags&DST_CHANGED?" (and others)":""
+		);
+}
+
+static inline int was_scan(struct host *h, enum prot_type p)
+{
+	return !(h->count < count_threshold);
+}
+
+void update_flags(struct host *h, enum prot_type prot, struct tcphdr *tcp)
+{
+	if(prot != TCP_TYPE) return;
+	h->syn_count += (tcp->th_flags) & TH_SYN ? 1:0; 		
+	h->fin_count += (tcp->th_flags) & TH_FIN ? 1:0; 
+}			
+
+void packet_init(struct host *h, struct any_pkt *ap, struct tcphdr *tcp, enum prot_type prot)
+{
+	h->syn_count = h->fin_count = 0;
+	h->from = ap->ip.ip_src.s_addr;
+	h->dst = ap->ip.ip_dst.s_addr;
+	h->low_port = ap->dest; 
+	h->hi_port = ap->dest;
+	h->prev_port = ap->dest;
+	h->count = 1;
+	h->start = now;
+	h->t = now;
+	update_flags(h, prot, tcp);
+}
+
+void action(struct any_pkt *ap, struct tcphdr *tcp, enum prot_type prot)
+{
+	int was = 0;
+	struct host *h;
+
+	if(cfg[prot]->flags & LOG_CONN && (prot == UDP_TYPE || 
+			(prot == TCP_TYPE && tcp->th_flags == TH_SYN))) 
+		dolog(ap, prot);
+	if(packet_match(ap, &cfg[prot]->host_scan_ign)) return;
+	if(ignore_port(cfg[prot]->port_scan_ignore, ntohs(ap->dest))) return;
+
+	h = allocate(&was, ap->ip.ip_src.s_addr, prot);
+	if(!h) {
+		syslog(LOG_ERR, " internal error, cannot allocate memory");
+		exit(1);
+	}
+	if (was) goto UPDATE_DATA;
+#ifdef DEBUG
+	syslog(LOG_NOTICE, "new host %s", inet_ntoa(ap->ip.ip_src));
+#endif
+	/*
+ 	 * Current host is going to be deleted. Check if a scan 
+	 * warning should be sent.
+ 	 */
+	if(was_scan(h, prot)) {
+		send_mail(h, prot);
+		log_scan(h, prot);
+	}
+	packet_init(h, ap, tcp, prot);
+	return;
+UPDATE_DATA:	
+	if (now - h->t <= SEC) {
+		if(!flood_det && h->prev_port == ap->dest) {
+			h->t = now;
+			return;
+		}
+		if(ap->ip.ip_dst.s_addr != h->dst) 
+			h->flags |= DST_CHANGED;
+//h->start = now;
+		h->count++;
+#ifdef DEBUG
+syslog(LOG_NOTICE, "update host %s %d", inet_ntoa(ap->ip.ip_src), h->count);
+#endif
+		h->hi_port = ap->dest;
+		if(h->prev_port == ap->dest) h->flood++;
+		h->prev_port = ap->dest;
+		update_flags(h, prot, tcp);
+	}
+	else if(!was_scan(h, prot) && now - h->t >= SCAN_EXPIRE) {
+		bzero(h, sizeof *h);
+		return;
+	}
+	h->t = now;
+}
+
+void search_scan()
+{
+	int i, p;
+	time_t now = time(0);
+	struct host *h;
+	for(p = 0; p < PROT_NR; p++)
+		for(i = 0; i < HOW_MANY; i++){
+			h = &hosts[p][i];
+#ifdef DEBUG
+syslog(LOG_NOTICE, "checking for scan %d", h->from);
+#endif
+			if((now - h->t) < SCAN_TIMEOUT || !was_scan(h, p))
+				continue;
+			log_scan(h, p);
+			send_mail(h, p);
+			h->count = 0;
+		}
+}
+
+void alarm_handler(int sig)
+{
+	alarm_flag = 1;
+	alarm(ALARM_TIMEOUT);
+}
+
+void hup_handler(int sig)
+{
+	syslog(LOG_NOTICE, "SIGHUP received. Reloading configuration.");
+	clear_conf(&tcp_opt);
+	clear_conf(&udp_opt);
+	load_defaults();
+	read_conf();
+#ifdef DEBUG
+	show_conf();
+#endif	
+}
+
+#define TH_XX	0x40
+#define TH_YY	0x80
+
+#define OS_FP		2
+
+#define NMAP_SX		0x1
+#define NMAP_NULL 	0x2
+#define NMAP_FSPU 	0x4
+#define NMAP_FPU	0x8
+#define QUESO_F 	0x10
+#define QUESO_FS 	0x20
+#define QUESO_P 	0x40
+#define QUESO_SXY	0x80
+
+struct probe_flags {
+	unsigned int id;
+	u_int8_t or_flags;
+	tcp_seq seq;
+	tcp_seq ack;
+	char *s;
+};
+
+struct probe_flags fp_probe[] = {
+	{ NMAP_SX, TH_SYN|TH_XX, 0, 0, "sx" },
+	{ NMAP_NULL, 0, 0, 0, "null" },
+	{ NMAP_FSPU, TH_FIN|TH_SYN|TH_PUSH|TH_URG, 0, 0, "fspu" },
+	{ NMAP_FPU, TH_FIN|TH_PUSH|TH_URG, 0, 0, "fpu" },
+	{ QUESO_F, TH_FIN, 0, 0, "f" },
+	{ QUESO_FS, TH_FIN|TH_SYN, 0, 0, "fs" },
+	{ QUESO_P, TH_PUSH, 0, 0, "p" },
+	{ QUESO_SXY, TH_SYN|TH_XX|TH_YY, 0, 0, "sxy" }
+};	
+
+static void osfp_mail(struct host *h, int count, char *s)
+{
+	char buf[512], pkts[64];
+	int i, size, c = 0;
+	size = sizeof(fp_probe)/sizeof(struct probe_flags);
+	for(i = 0; i < size; i++) {
+		if(!(h->osfp_flags & fp_probe[i].id)) continue;
+		c += snprintf(pkts + c, sizeof pkts - c,
+			"%s,", fp_probe[i].s);
+//printf(__FUNCTION__ ": %s\n", fp_probe[i].s);
+	}
+	snprintf(buf, sizeof buf, 
+		"Possible %s OS fingerprinting probe from %s\n"
+		"%d packets were detected with following TCP flags:\n"
+		"%s\nFirst packet arrived at %s\n\r\n.\r\n",
+		s, hostlookup(h->from),count, pkts, ctime(&h->start)
+		);
+	if(flood_prevent(buf)) return;
+	__send_mail(buf, "OS fingerprinting probe");
+}	
+
+/*
+ * If we have 3 suspicous packets then it is probably OS probe. 
+ * Lower 4 bits in host->osfp_flags are related to
+ * queso packets. Next 4 bits  are for nmap.
+ * If count == 3 and tcp flags in packets where not specific
+ * to nmap nor queso then os probe is "unknown" (return 3)
+ */
+static int was_probe(int f, int *count)
+{
+	int i, size = sizeof fp_probe/sizeof(struct probe_flags);
+	int found = 0;
+	*count = 0;
+	for(i = 0; i < size; i++) {
+//	        *count += (f & (1 << i))?1:0;
+		*count += (f & fp_probe[i].id)?1:0;
+//syslog(LOG_NOTICE, "flag %d : %d", f&(1<<i), i);
+		if(*count == 3) found = 1;		 
+	}		 
+	if(!found) return 0;
+	if(f & 0xf && f < 0xf) return 1;
+	if(f & 0xf0 && f >= 0xf) return 2;
+	return 3;
+}
+
+char *osfp_type[] = { "nmap", "queso", "unknown" };
+
+static  void probe_check(struct tcppkt *pkt)
+{
+	int i, was, found = 0;
+	struct host *h;
+	int t, count;
+	int s = sizeof(fp_probe)/sizeof(struct probe_flags);
+	/* is there something interesting? */
+	for(i = 0; i < s; i++) {
+		if(fp_probe[i].or_flags != pkt->tcp.th_flags) continue;
+//syslog(LOG_NOTICE, __FUNCTION__ "%d: %s found", i, fp_probe[i].s);
+		found = 1;
+		break;
+	}
+	if(!found) return;
+	h = allocate(&was, pkt->ip.ip_src.s_addr, OS_FP);
+	if(!was) {
+		h->from = pkt->ip.ip_src.s_addr;
+		h->osfp_flags = 0;
+		h->start = now;
+	}
+	if(h->osfp_flags && now - h->t > 2*SEC) return;
+	h->t = now;
+	h->osfp_flags |= fp_probe[i].id;
+	t = was_probe(h->osfp_flags, &count);
+	if(!t) return;
+	if(osfp_options & SEND_MAIL && !(h->flags & MAIL_SENT)) {
+		h->flags |= MAIL_SENT;
+		osfp_mail(h, count, osfp_type[t-1]);	
+	}	
+//syslog(LOG_NOTICE, "id %d %s %d", fp_probe[i].id, hostlookup(h->from), h->osfp_flags);
+	if(h->flags & SCAN_LOGGED || !(osfp_options & LOG_SCAN)) return;
+	h->flags |= SCAN_LOGGED;
+	syslog(LOG_NOTICE, "Possible %s OS probe from %s",
+		osfp_type[t-1], hostlookup(h->from)
+		);
+	return;	
+}	
+
+int main(int argc, char **argv)
+{
+	int s, su, err = 0;
+	gid_t grp[2];
+	char *i;
+	struct sigaction sa;
+	struct passwd *p;
+ 	fd_set read_fds;
+	
+	if (geteuid())
+		errx(1, "This program requires root priviledges.");
+	sa.sa_handler = alarm_handler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	
+	INIT_LIST_HEAD(&udp_opt.host_scan_ign);	
+	INIT_LIST_HEAD(&udp_opt.host_log_ign);	
+	INIT_LIST_HEAD(&tcp_opt.host_scan_ign);	
+	INIT_LIST_HEAD(&tcp_opt.host_log_ign);	
+	
+	load_defaults();
+	read_conf();
+	if(argc == 2) {
+		if(!strncmp(argv[1], "-v", 2)) show_conf();
+		else if(!strncmp(argv[1], "-s", 2)) {
+			show_conf();
+			exit(0);
+		}
+	}
+	i = get_config_item("RunAsUser")->value.svalue;
+	p = getpwnam(i);
+	
+	if ((s = socket(AF_INET, SOCK_RAW, 6)) == -1)
+		errx(1, "Cannot open TCP raw socket. Exiting.");
+	if ((su = socket(AF_INET, SOCK_RAW, 17)) == -1)
+		errx(1, "Cannot open UDP raw socket. Exiting.");
+	fcntl(s, F_SETFL, O_NONBLOCK);
+	fcntl(su, F_SETFL, O_NONBLOCK);
+	openlog("scandetd", LOG_NDELAY, syslog_facility);
+
+	daemon(1, 1);
+	pid_file(PID_FILE);
+	
+	/* Drop root priviledges */	
+	if(!p) {
+		syslog(LOG_ERR, "%s doesn't exists. Exiting.", i);
+		exit(1);
+	}  
+	grp[0] = grp[1] = p->pw_gid;
+	err = setgroups(1, grp);
+	err = setgid(p->pw_gid);
+	err = setuid(p->pw_uid);
+	if(err == -1) {
+		syslog(LOG_ERR, "Cannot drop root priviledges. Exiting.");
+		exit(1);
+	}
+	init();
+
+	syslog(LOG_NOTICE,"scandetd ver. " VERSION "  started and ready");
+
+	FD_ZERO(&read_fds);
+	sigaction(SIGALRM, &sa, 0);
+	signal(SIGHUP, hup_handler);
+	alarm(ALARM_TIMEOUT);
+	
+	/* to avoid zombies */
+	signal(SIGCHLD,SIG_IGN);		
+
+	for(;;) {
+		int len, ret;
+		FD_SET(su, &read_fds);
+		FD_SET(s, &read_fds);		
+		ret = select(su+1, &read_fds, 0, 0, 0);
+		if(alarm_flag) {
+			alarm_flag = 0;
+			search_scan();
+		}
+		/*
+		 * Don't process the data if select was interrupted
+		 * by alarm().
+		 */
+		if(ret == -1 && errno == EINTR) 
+			continue;
+		now = time(NULL);
+		if(FD_ISSET(su, &read_fds)) 
+			if(read(su, (struct udppkt*) &udp_pkt, sizeof udp_pkt) >= sizeof udp_pkt)
+				action((struct any_pkt *)&udp_pkt, 0, UDP_TYPE);
+
+		if(!FD_ISSET(s, &read_fds)) continue;
+		len = read(s, (struct tcppkt*) &pkt, sizeof pkt);
+
+		if (len < sizeof pkt) continue;	
+		if(osfp_options) probe_check(&pkt);
+
+		if (pkt.tcp.th_flags < 3)
+			action((struct any_pkt *) &pkt, &pkt.tcp, TCP_TYPE);
+	}
+}
+ 
